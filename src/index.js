@@ -21,6 +21,9 @@ const DEFAULT_NETEASE_COOKIE_KV_KEY = 'NETEASE_COOKIE';
 const DEFAULT_NETEASE_COOKIE_META_KV_KEY = 'NETEASE_COOKIE_META';
 const AUTH_SIGNATURE_VERSION = 'hmac-sha256-v1';
 const COOKIE_ATTRIBUTE_NAMES = new Set(['domain', 'path', 'expires', 'max-age', 'httponly', 'secure', 'samesite', 'priority']);
+const NETEASE_PLAYLIST_DETAIL_API = '/api/v6/playlist/detail';
+const NETEASE_SONG_DETAIL_API = '/api/v3/song/detail';
+const NETEASE_PLAYLIST_BATCH_SIZE = 100;
 const NETEASE_PLAYER_URL_V1_API = '/api/song/enhance/player/url/v1';
 const NETEASE_AUDIO_HOST_REWRITES = [
     ['m801.', 'm701.'],
@@ -103,7 +106,7 @@ async function handleRequest(request, env, ctx) {
         );
     }
 
-    if (!isSongRoute(url.pathname)) {
+    if (!isApiRoute(url.pathname)) {
         return jsonResponse({ error: '未找到对应路由' }, 404, {
             'Cache-Control': 'no-store',
         });
@@ -117,19 +120,20 @@ async function handleRequest(request, env, ctx) {
     }
 
     const config = readConfig(url, env);
+    const idLabel = config.type === 'playlist' ? '歌单 ID' : '歌曲 ID';
     if (!config.id) {
-        return jsonResponse({ error: '缺少歌曲 ID' }, 400, {
+        return jsonResponse({ error: `缺少${idLabel}` }, 400, {
             'Cache-Control': 'no-store',
         });
     }
 
     if (!/^[0-9A-Za-z_]+$/.test(config.id)) {
-        return jsonResponse({ error: '歌曲 ID 格式不合法' }, 400, {
+        return jsonResponse({ error: `${idLabel} 格式不合法` }, 400, {
             'Cache-Control': 'no-store',
         });
     }
 
-    if (!['song', 'url', 'pic', 'lrc'].includes(config.type)) {
+    if (!['song', 'playlist', 'url', 'pic', 'lrc'].includes(config.type)) {
         return jsonResponse({ error: '不支持的 type' }, 400, {
             'Cache-Control': 'no-store',
         });
@@ -574,7 +578,7 @@ async function handleTelegramPushTest(request, env) {
     );
 }
 
-function isSongRoute(pathname) {
+function isApiRoute(pathname) {
     return pathname === '/' || pathname === '/song';
 }
 
@@ -1326,6 +1330,9 @@ async function handleApiType(request, config, env) {
     if (config.type === 'song') {
         return handleSongType(request, config, env);
     }
+    if (config.type === 'playlist') {
+        return handlePlaylistType(request, config, env);
+    }
     if (config.type === 'url') {
         return handleUrlType(config, env);
     }
@@ -1343,6 +1350,32 @@ async function handleSongType(request, config, env) {
         return buildSongResponse(request, config, formatTencentSong(await fetchTencentSong(config.id, env)), env);
     }
     return buildSongResponse(request, config, await fetchNeteaseSong(config.id, env), env);
+}
+
+async function handlePlaylistType(request, config, env) {
+    if (config.server !== 'netease') {
+        throw new ApiError(400, 'playlist 目前仅支持网易云音乐');
+    }
+
+    const songs = await fetchNeteasePlaylist(config.id, env);
+    const payload = await Promise.all(songs.map(async (song) => {
+        const [url, pic, lrc] = await Promise.all([
+            buildApiEndpointUrl(request, config, 'url', song.urlId, env),
+            buildApiEndpointUrl(request, config, 'pic', song.picId, env),
+            buildApiEndpointUrl(request, config, 'lrc', song.lyricId, env),
+        ]);
+
+        return {
+            name: song.name,
+            artist: song.artist.join('/'),
+            album: song.album,
+            url,
+            pic,
+            lrc,
+        };
+    }));
+
+    return jsonResponse(payload, 200);
 }
 
 async function buildSongResponse(request, config, song, env) {
@@ -1418,10 +1451,10 @@ async function fetchNeteaseSong(id, env) {
         throw new ApiError(400, '网易云歌曲 ID 必须是数字');
     }
 
-    const data = await callNeteaseApi(
-        '/api/v3/song/detail/',
+    const data = await callNeteaseEapi(
+        NETEASE_SONG_DETAIL_API,
         {
-            c: JSON.stringify([{ id: numericId, v: 0 }]),
+            c: JSON.stringify([{ id: numericId }]),
         },
         env
     );
@@ -1432,6 +1465,71 @@ async function fetchNeteaseSong(id, env) {
     }
 
     return formatNeteaseSong(song);
+}
+
+async function fetchNeteasePlaylist(id, env) {
+    const playlistId = String(id || '').trim();
+    if (!/^\d+$/.test(playlistId)) {
+        throw new ApiError(400, '网易云歌单 ID 必须是数字');
+    }
+
+    const cookie = await getNeteaseCookie(env);
+    const playlistData = await callNeteaseEapiWithCookie(
+        NETEASE_PLAYLIST_DETAIL_API,
+        {
+            id: playlistId,
+            t: '0',
+            n: '50',
+            s: '5',
+        },
+        env,
+        cookie
+    );
+    const rawTrackIds = playlistData?.playlist?.trackIds;
+
+    if (!Array.isArray(rawTrackIds) || rawTrackIds.length === 0) {
+        throw new ApiError(404, '网易云歌单不存在或为空');
+    }
+
+    const trackIds = rawTrackIds
+        .map((item) => item?.id)
+        .filter((trackId) => /^\d+$/.test(String(trackId ?? '')));
+
+    if (trackIds.length === 0) {
+        throw new ApiError(404, '网易云歌单不存在或为空');
+    }
+
+    const songsById = new Map();
+    for (let offset = 0; offset < trackIds.length; offset += NETEASE_PLAYLIST_BATCH_SIZE) {
+        const batch = trackIds.slice(offset, offset + NETEASE_PLAYLIST_BATCH_SIZE);
+        const data = await callNeteaseEapiWithCookie(
+            NETEASE_SONG_DETAIL_API,
+            {
+                c: JSON.stringify(batch.map((trackId) => ({ id: trackId }))),
+            },
+            env,
+            cookie
+        );
+
+        if (!Array.isArray(data?.songs)) {
+            throw new ApiError(502, '网易云歌单歌曲详情数据不完整');
+        }
+
+        for (const rawSong of data.songs) {
+            const song = formatNeteaseSong(rawSong);
+            songsById.set(song.id, song);
+        }
+    }
+
+    const songs = trackIds
+        .map((trackId) => songsById.get(String(trackId)))
+        .filter(Boolean);
+
+    if (songs.length === 0) {
+        throw new ApiError(404, '网易云歌单不存在或为空');
+    }
+
+    return songs;
 }
 
 async function fetchNeteaseUrl(id, br, env) {
@@ -1470,17 +1568,6 @@ async function fetchNeteaseUrl(id, br, env) {
         }
     }
 
-    const legacyItem = await fetchLegacyNeteaseUrlItem(numericId, br, env);
-    const legacyUrl = legacyItem ? legacyItem.uf?.url || legacyItem.url || '' : '';
-    if (legacyUrl) {
-        return {
-            url: rewriteNeteaseAudioUrl(legacyUrl),
-            size: legacyItem.size || 0,
-            br: legacyItem.br || -1,
-            level: 'legacy',
-        };
-    }
-
     return {
         url: '',
         size: lastItem ? lastItem.size || 0 : 0,
@@ -1489,42 +1576,21 @@ async function fetchNeteaseUrl(id, br, env) {
     };
 }
 
-async function fetchLegacyNeteaseUrlItem(numericId, br, env) {
-    try {
-        const data = await callNeteaseApi(
-            '/api/song/enhance/player/url',
-            {
-                ids: [numericId],
-                br: br * 1000,
-            },
-            env
-        );
-        return data && Array.isArray(data.data) ? data.data[0] : null;
-    } catch (error) {
-        console.warn(`网易云旧版音频地址兜底失败: ${error && error.message ? error.message : String(error)}`);
-        return null;
-    }
-}
-
 async function fetchNeteaseLyric(id, env) {
     const numericId = Number.parseInt(id, 10);
     if (!Number.isFinite(numericId)) {
         throw new ApiError(400, '网易云歌曲 ID 必须是数字');
     }
 
-    const data = await callNeteaseApi(
+    const data = await callNeteaseEapi(
         '/api/song/lyric',
         {
             id: numericId,
-            os: 'pc',
             lv: -1,
             kv: -1,
             tv: -1,
             rv: -1,
-            yv: 1,
-            showRole: 'False',
-            cp: 'False',
-            e_r: 'False',
+            yv: -1,
         },
         env
     );
@@ -1535,33 +1601,18 @@ async function fetchNeteaseLyric(id, env) {
     };
 }
 
-async function callNeteaseApi(pathname, body, env) {
-    const response = await postNeteaseWeapi(pathname, body, env, await getNeteaseCookie(env));
-
-    if (!response.ok) {
-        throw new ApiError(502, `网易云上游请求失败: ${response.status}`);
-    }
-
-    return response.json();
-}
-
 async function callNeteaseEapi(pathname, body, env) {
-    const response = await postNeteaseEapi(pathname, body, env, await getNeteaseCookie(env));
+    return callNeteaseEapiWithCookie(pathname, body, env, await getNeteaseCookie(env));
+}
+
+async function callNeteaseEapiWithCookie(pathname, body, env, cookie) {
+    const response = await postNeteaseEapi(pathname, body, env, cookie);
 
     if (!response.ok) {
         throw new ApiError(502, `网易云上游请求失败: ${response.status}`);
     }
 
     return response.json();
-}
-
-async function postNeteaseWeapi(pathname, body, env, cookie, options = {}) {
-    const encryptedBody = await createNeteaseBody(body);
-    return fetch(`https://music.163.com${pathname.replace('/api/', '/weapi/')}`, {
-        method: 'POST',
-        headers: createNeteaseHeaders(env, cookie, options),
-        body: new URLSearchParams(encryptedBody).toString(),
-    });
 }
 
 async function postNeteaseRefreshWeapi(cookie) {
@@ -1607,19 +1658,6 @@ async function readStoredNeteaseCookie(env) {
     }
 }
 
-function createNeteaseHeaders(env, cookie, options = {}) {
-    return {
-        Referer: 'https://music.163.com/',
-        Cookie: cookie || env.NETEASE_COOKIE || DEFAULT_NETEASE_COOKIE,
-        'User-Agent': options.userAgent || DEFAULT_NETEASE_UA,
-        'X-Real-IP': randomNeteaseIp(),
-        Accept: '*/*',
-        'Accept-Language': 'zh-CN,zh;q=0.8',
-        Connection: 'keep-alive',
-        'Content-Type': 'application/x-www-form-urlencoded',
-    };
-}
-
 function createNeteaseEapiHeaders(env, cookie, options = {}) {
     const spoofIp = randomNeteaseIp();
     return {
@@ -1654,6 +1692,10 @@ function createNeteaseMobileCookieHeader(cookie) {
     jar.set('buildver', String(Math.floor(Date.now() / 1000)));
     jar.set('resolution', '1920x1080');
     jar.set('os', 'android');
+
+    if (!jar.has('NMTID')) {
+        jar.set('NMTID', `00${randomHex(30)}`);
+    }
 
     if (!jar.has('MUSIC_U') && !jar.has('MUSIC_A')) {
         jar.set('MUSIC_A', DEFAULT_NETEASE_MUSIC_A);
