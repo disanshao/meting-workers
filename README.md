@@ -68,7 +68,7 @@
 各 type 的行为：
 
 - `type=song` 返回 JSON 数组
-- `type=playlist` 返回歌单内全部可用歌曲的 JSON 数组；会按 100 首一批补全歌曲详情并保持歌单顺序
+- `type=playlist` 返回歌单内全部可用歌曲的 JSON 数组；优先保持网易云客户端展示的手动顺序，缺失的歌曲详情会按 100 首一批补全
 - `type=url` 返回 302 到真实音频地址
 - `type=pic` 返回 302 到真实封面地址
 - `type=lrc` 返回纯文本歌词
@@ -255,7 +255,7 @@ wrangler secret put TELEGRAM_CHAT_ID
 - `type=song` 的输出结构改成更接近老版 Meting API 的 `title` / `author` / `url` / `pic` / `lrc`。
 - `type=song` 只取歌曲元数据，`url` / `pic` / `lrc` 的真实内容改由二级接口返回。
 - 网易云的单曲详情、歌单详情、批量歌曲详情、音频地址和歌词统一使用 EAPI；移动端 Cookie 会自动补齐 `NMTID` 等必要字段。登录 token refresh 仍使用对应的 WEAPI 续期接口。
-- `type=playlist` 先通过 EAPI 读取完整 `trackIds`，再按 100 首分批获取歌曲详情，避免只返回详情接口首批携带的歌曲。
+- `type=playlist` 会请求完整的 `playlist.tracks` 并优先采用其客户端展示顺序；若 `tracks` 不完整，再按 `trackIds` 补齐缺失歌曲，并以 100 首为一批获取详情。
 - 白名单校验放在缓存读取之前，避免缓存命中绕过来源限制。
 - 鉴权语义对齐原项目：只对 `url` / `pic` / `lrc` 强制校验 `auth`，`song` / `playlist` 只负责生成带签名的二级链接。
 - 如果启用了 `AUTH_ENABLED`（或直接配置了 `AUTH_SECRET`），会对 `url` / `pic` / `lrc` 生成 HMAC-SHA256 `auth` 参数；缺失或错误签名会返回 `403 {"error":"非法请求"}`。

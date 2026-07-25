@@ -24,6 +24,7 @@ const COOKIE_ATTRIBUTE_NAMES = new Set(['domain', 'path', 'expires', 'max-age', 
 const NETEASE_PLAYLIST_DETAIL_API = '/api/v6/playlist/detail';
 const NETEASE_SONG_DETAIL_API = '/api/v3/song/detail';
 const NETEASE_PLAYLIST_BATCH_SIZE = 100;
+const NETEASE_PLAYLIST_ORDER_CACHE_VERSION = 'tracks-first-v1';
 const NETEASE_PLAYER_URL_V1_API = '/api/song/enhance/player/url/v1';
 const NETEASE_AUDIO_HOST_REWRITES = [
     ['m801.', 'm701.'],
@@ -637,6 +638,7 @@ function buildCacheKey(request, config, env) {
         lrctype: config.lrctype,
         auth_enabled: isAuthEnabled(env) ? '1' : '0',
         auth_signature: AUTH_SIGNATURE_VERSION,
+        playlist_order: config.type === 'playlist' ? NETEASE_PLAYLIST_ORDER_CACHE_VERSION : '',
     }).toString();
     return new Request(cacheUrl.toString(), { method: 'GET' });
 }
@@ -1479,33 +1481,66 @@ async function fetchNeteasePlaylist(id, env) {
         {
             id: playlistId,
             t: '0',
-            n: '50',
+            n: '100000',
             s: '5',
         },
         env,
         cookie
     );
-    const rawTrackIds = playlistData?.playlist?.trackIds;
+    const rawTrackIds = Array.isArray(playlistData?.playlist?.trackIds)
+        ? playlistData.playlist.trackIds
+        : [];
+    const rawTracks = Array.isArray(playlistData?.playlist?.tracks)
+        ? playlistData.playlist.tracks
+        : [];
+    const trackIds = rawTrackIds
+        .map((item) => normalizeNeteaseTrackId(item?.id))
+        .filter(Boolean);
+    const canonicalTrackIds = new Set(trackIds);
+    const orderedTrackIds = [];
+    const seenTrackIds = new Set();
 
-    if (!Array.isArray(rawTrackIds) || rawTrackIds.length === 0) {
-        throw new ApiError(404, '网易云歌单不存在或为空');
+    // playlist.tracks follows the order shown by current NetEase clients, including
+    // manually arranged playlists. trackIds is complete more often, but can expose
+    // collection-time order instead, so only use it to append tracks missing here.
+    for (const rawSong of rawTracks) {
+        const trackId = normalizeNeteaseTrackId(rawSong?.id);
+        if (!trackId || seenTrackIds.has(trackId)) {
+            continue;
+        }
+        if (canonicalTrackIds.size > 0 && !canonicalTrackIds.has(trackId)) {
+            continue;
+        }
+        orderedTrackIds.push(trackId);
+        seenTrackIds.add(trackId);
     }
 
-    const trackIds = rawTrackIds
-        .map((item) => item?.id)
-        .filter((trackId) => /^\d+$/.test(String(trackId ?? '')));
+    for (const trackId of trackIds) {
+        if (!seenTrackIds.has(trackId)) {
+            orderedTrackIds.push(trackId);
+            seenTrackIds.add(trackId);
+        }
+    }
 
-    if (trackIds.length === 0) {
+    if (orderedTrackIds.length === 0) {
         throw new ApiError(404, '网易云歌单不存在或为空');
     }
 
     const songsById = new Map();
-    for (let offset = 0; offset < trackIds.length; offset += NETEASE_PLAYLIST_BATCH_SIZE) {
-        const batch = trackIds.slice(offset, offset + NETEASE_PLAYLIST_BATCH_SIZE);
+    for (const rawSong of rawTracks) {
+        const trackId = normalizeNeteaseTrackId(rawSong?.id);
+        if (trackId && seenTrackIds.has(trackId)) {
+            songsById.set(trackId, formatNeteaseSong(rawSong));
+        }
+    }
+
+    const missingTrackIds = orderedTrackIds.filter((trackId) => !songsById.has(trackId));
+    for (let offset = 0; offset < missingTrackIds.length; offset += NETEASE_PLAYLIST_BATCH_SIZE) {
+        const batch = missingTrackIds.slice(offset, offset + NETEASE_PLAYLIST_BATCH_SIZE);
         const data = await callNeteaseEapiWithCookie(
             NETEASE_SONG_DETAIL_API,
             {
-                c: JSON.stringify(batch.map((trackId) => ({ id: trackId }))),
+                c: JSON.stringify(batch.map((trackId) => ({ id: Number(trackId) }))),
             },
             env,
             cookie
@@ -1521,7 +1556,7 @@ async function fetchNeteasePlaylist(id, env) {
         }
     }
 
-    const songs = trackIds
+    const songs = orderedTrackIds
         .map((trackId) => songsById.get(String(trackId)))
         .filter(Boolean);
 
@@ -1530,6 +1565,11 @@ async function fetchNeteasePlaylist(id, env) {
     }
 
     return songs;
+}
+
+function normalizeNeteaseTrackId(value) {
+    const trackId = String(value ?? '').trim();
+    return /^\d+$/.test(trackId) ? trackId : '';
 }
 
 async function fetchNeteaseUrl(id, br, env) {

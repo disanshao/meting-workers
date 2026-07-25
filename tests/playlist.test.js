@@ -70,8 +70,38 @@ async function hmacSha256(text, secret) {
         .join('');
 }
 
-test('网易云 playlist 通过 EAPI 按 100 首拆批并保持 trackIds 顺序', async () => {
-    const trackIds = [201, ...Array.from({ length: 199 }, (_, index) => index + 1), 200];
+test('网易云 playlist 优先采用完整 tracks 的手动顺序', async () => {
+    let upstreamCalls = 0;
+
+    await withMockFetch(async (input) => {
+        const url = String(input);
+        upstreamCalls += 1;
+        assert.ok(url.endsWith('/eapi/v6/playlist/detail'));
+        return jsonUpstreamResponse({
+            code: 200,
+            playlist: {
+                trackIds: [{ id: 1 }, { id: 2 }, { id: 3 }],
+                tracks: [createRawSong(3), createRawSong(1), createRawSong(2)],
+            },
+        });
+    }, async () => {
+        const response = await requestWorker(
+            'https://worker.example/?server=netease&type=playlist&id=42'
+        );
+        const payload = await response.json();
+
+        assert.equal(response.status, 200);
+        assert.equal(upstreamCalls, 1);
+        assert.deepEqual(payload.map((song) => song.name), [
+            'Song 3',
+            'Song 1',
+            'Song 2',
+        ]);
+    });
+});
+
+test('网易云 playlist 在 tracks 不完整时补充 trackIds 并按 100 首拆批', async () => {
+    const trackIds = [...Array.from({ length: 201 }, (_, index) => index + 1)];
     let detailBatch = 0;
 
     await withMockFetch(async (input) => {
@@ -81,6 +111,7 @@ test('网易云 playlist 通过 EAPI 按 100 首拆批并保持 trackIds 顺序'
                 code: 200,
                 playlist: {
                     trackIds: trackIds.map((id) => ({ id })),
+                    tracks: [createRawSong(201), createRawSong(1)],
                 },
             });
         }
@@ -89,18 +120,12 @@ test('网易云 playlist 通过 EAPI 按 100 首拆批并保持 trackIds 顺序'
             detailBatch += 1;
             if (detailBatch === 1) {
                 return jsonUpstreamResponse({
-                    songs: [
-                        ...Array.from({ length: 99 }, (_, index) => createRawSong(99 - index)),
-                        createRawSong(201),
-                    ],
+                    songs: Array.from({ length: 100 }, (_, index) => createRawSong(101 - index)),
                 });
             }
-            if (detailBatch === 2) {
-                return jsonUpstreamResponse({
-                    songs: Array.from({ length: 100 }, (_, index) => createRawSong(199 - index)),
-                });
-            }
-            return jsonUpstreamResponse({ songs: [createRawSong(200)] });
+            return jsonUpstreamResponse({
+                songs: Array.from({ length: 99 }, (_, index) => createRawSong(200 - index)),
+            });
         }
 
         throw new Error(`Unexpected upstream URL: ${url}`);
@@ -111,7 +136,7 @@ test('网易云 playlist 通过 EAPI 按 100 首拆批并保持 trackIds 顺序'
         const payload = await response.json();
 
         assert.equal(response.status, 200);
-        assert.equal(detailBatch, 3);
+        assert.equal(detailBatch, 2);
         assert.equal(payload.length, 201);
         assert.equal(payload[0].name, 'Song 201');
         assert.equal(payload[1].name, 'Song 1');
