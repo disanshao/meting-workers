@@ -3,6 +3,7 @@ const NETEASE_PUBKEY = 65537n;
 const NETEASE_NONCE = '0CoJUm6Qyw8W8jud';
 const NETEASE_IV = '0102030405060708';
 const NETEASE_EAPI_KEY = 'e82ckenh8dichen8';
+const NETEASE_CACHE_KEY = ')(13daqP@ssw0rd~';
 const NETEASE_EAPI_SALT = '36cd479b6b5';
 
 const DEFAULT_NETEASE_COOKIE = 'appver=8.2.30; os=iPhone OS; osver=15.0; EVNSM=1.0.0; buildver=2206; channel=distribution; machineid=iPhone13.3';
@@ -22,6 +23,7 @@ const DEFAULT_NETEASE_COOKIE_META_KV_KEY = 'NETEASE_COOKIE_META';
 const AUTH_SIGNATURE_VERSION = 'hmac-sha256-v1';
 const COOKIE_ATTRIBUTE_NAMES = new Set(['domain', 'path', 'expires', 'max-age', 'httponly', 'secure', 'samesite', 'priority']);
 const NETEASE_PLAYLIST_DETAIL_API = '/api/v6/playlist/detail';
+const NETEASE_ALBUM_DETAIL_API = '/api/album/v3/detail';
 const NETEASE_SONG_DETAIL_API = '/api/v3/song/detail';
 const NETEASE_PLAYLIST_BATCH_SIZE = 100;
 const NETEASE_PLAYLIST_ORDER_CACHE_VERSION = 'tracks-first-v1';
@@ -121,7 +123,11 @@ async function handleRequest(request, env, ctx) {
     }
 
     const config = readConfig(url, env);
-    const idLabel = config.type === 'playlist' ? '歌单 ID' : '歌曲 ID';
+    const idLabel = config.type === 'playlist'
+        ? '歌单 ID'
+        : config.type === 'album'
+            ? '专辑 ID'
+            : '歌曲 ID';
     if (!config.id) {
         return jsonResponse({ error: `缺少${idLabel}` }, 400, {
             'Cache-Control': 'no-store',
@@ -134,7 +140,7 @@ async function handleRequest(request, env, ctx) {
         });
     }
 
-    if (!['song', 'playlist', 'url', 'pic', 'lrc'].includes(config.type)) {
+    if (!['song', 'playlist', 'album', 'url', 'pic', 'lrc'].includes(config.type)) {
         return jsonResponse({ error: '不支持的 type' }, 400, {
             'Cache-Control': 'no-store',
         });
@@ -1335,6 +1341,9 @@ async function handleApiType(request, config, env) {
     if (config.type === 'playlist') {
         return handlePlaylistType(request, config, env);
     }
+    if (config.type === 'album') {
+        return handleAlbumType(request, config, env);
+    }
     if (config.type === 'url') {
         return handleUrlType(config, env);
     }
@@ -1359,7 +1368,18 @@ async function handlePlaylistType(request, config, env) {
         throw new ApiError(400, 'playlist 目前仅支持网易云音乐');
     }
 
-    const songs = await fetchNeteasePlaylist(config.id, env);
+    return buildSongCollectionResponse(request, config, await fetchNeteasePlaylist(config.id, env), env);
+}
+
+async function handleAlbumType(request, config, env) {
+    if (config.server !== 'netease') {
+        throw new ApiError(400, 'album 目前仅支持网易云音乐');
+    }
+
+    return buildSongCollectionResponse(request, config, await fetchNeteaseAlbum(config.id, env), env);
+}
+
+async function buildSongCollectionResponse(request, config, songs, env) {
     const payload = await Promise.all(songs.map(async (song) => {
         const [url, pic, lrc] = await Promise.all([
             buildApiEndpointUrl(request, config, 'url', song.urlId, env),
@@ -1562,6 +1582,53 @@ async function fetchNeteasePlaylist(id, env) {
 
     if (songs.length === 0) {
         throw new ApiError(404, '网易云歌单不存在或为空');
+    }
+
+    return songs;
+}
+
+async function fetchNeteaseAlbum(id, env) {
+    const albumId = String(id || '').trim();
+    if (!/^\d+$/.test(albumId)) {
+        throw new ApiError(400, '网易云专辑 ID 必须是数字');
+    }
+
+    const numericId = Number(albumId);
+    if (!Number.isSafeInteger(numericId)) {
+        throw new ApiError(400, '网易云专辑 ID 超出支持范围');
+    }
+
+    const data = await callNeteaseEapi(
+        NETEASE_ALBUM_DETAIL_API,
+        {
+            id: numericId,
+            cache_key: await createNeteaseAlbumCacheKey(numericId),
+        },
+        env
+    );
+    const upstreamCode = data?.code === undefined ? 200 : Number(data.code);
+
+    if (upstreamCode !== 200) {
+        if (upstreamCode === 404) {
+            throw new ApiError(404, '网易云专辑不存在或为空');
+        }
+        throw new ApiError(502, `网易云专辑详情请求失败: ${upstreamCode}`);
+    }
+
+    const returnedAlbumId = normalizeNeteaseTrackId(data?.album?.id);
+    const rawSongs = Array.isArray(data?.songs) ? data.songs : [];
+    if (!returnedAlbumId || rawSongs.length === 0) {
+        throw new ApiError(404, '网易云专辑不存在或为空');
+    }
+    if (returnedAlbumId !== String(numericId)) {
+        throw new ApiError(502, '网易云专辑详情 ID 不匹配');
+    }
+
+    const songs = rawSongs
+        .filter((song) => normalizeNeteaseTrackId(song?.id))
+        .map((song) => formatNeteaseSong(song));
+    if (songs.length === 0) {
+        throw new ApiError(404, '网易云专辑不存在或为空');
     }
 
     return songs;
@@ -2200,6 +2267,10 @@ async function createNeteaseEapiBody(pathname, body) {
     };
 }
 
+async function createNeteaseAlbumCacheKey(albumId) {
+    return bytesToBase64(await aesEcbEncrypt(`id=${albumId}`, NETEASE_CACHE_KEY));
+}
+
 function randomHex(length) {
     const bytes = new Uint8Array(Math.ceil(length / 2));
     crypto.getRandomValues(bytes);
@@ -2233,6 +2304,10 @@ async function aesCbcEncryptBase64(text, keyText) {
 }
 
 async function aesEcbEncryptHexUpper(text, keyText) {
+    return bytesToHexUpper(await aesEcbEncrypt(text, keyText));
+}
+
+async function aesEcbEncrypt(text, keyText) {
     const cryptoKey = await crypto.subtle.importKey(
         'raw',
         encoder.encode(keyText),
@@ -2259,7 +2334,7 @@ async function aesEcbEncryptHexUpper(text, keyText) {
         encrypted.set(new Uint8Array(encryptedBlock).slice(0, 16), offset);
     }
 
-    return bytesToHexUpper(encrypted);
+    return encrypted;
 }
 
 function pkcs7Pad(bytes, blockSize) {

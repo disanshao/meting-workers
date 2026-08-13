@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createDecipheriv } from 'node:crypto';
 import test from 'node:test';
 
 import worker from '../src/index.js';
@@ -68,6 +69,32 @@ async function hmacSha256(text, secret) {
     return Array.from(new Uint8Array(signature))
         .map((byte) => byte.toString(16).padStart(2, '0'))
         .join('');
+}
+
+function decryptAes128Ecb(value, key, encoding) {
+    const decipher = createDecipheriv('aes-128-ecb', Buffer.from(key), null);
+    return Buffer.concat([
+        decipher.update(Buffer.from(value, encoding)),
+        decipher.final(),
+    ]).toString('utf8');
+}
+
+function decodeNeteaseEapiRequest(body, pathname) {
+    const encrypted = new URLSearchParams(body).get('params') || '';
+    assert.match(encrypted, /^[0-9A-F]+$/);
+
+    const decrypted = decryptAes128Ecb(encrypted, 'e82ckenh8dichen8', 'hex');
+    const salt = '36cd479b6b5';
+    const prefix = `${pathname}-${salt}-`;
+    const digestSeparator = `-${salt}-`;
+    assert.ok(decrypted.startsWith(prefix));
+
+    const payloadAndDigest = decrypted.slice(prefix.length);
+    const separatorIndex = payloadAndDigest.lastIndexOf(digestSeparator);
+    assert.ok(separatorIndex > 0);
+    assert.match(payloadAndDigest.slice(separatorIndex + digestSeparator.length), /^[0-9a-f]{32}$/);
+
+    return JSON.parse(payloadAndDigest.slice(0, separatorIndex));
 }
 
 test('网易云 playlist 优先采用完整 tracks 的手动顺序', async () => {
@@ -273,5 +300,127 @@ test('playlist 拒绝 QQ 音乐和非数字网易云歌单 ID', async () => {
         assert.deepEqual(await invalidIdResponse.json(), {
             error: '网易云歌单 ID 必须是数字',
         });
+    });
+});
+
+test('网易云 album 使用 MusicBot-Go 专辑 EAPI 并返回标准歌曲数组', async () => {
+    const authSecret = 'album-test-secret';
+    let upstreamCalls = 0;
+
+    await withMockFetch(async (input, init) => {
+        const url = new URL(String(input));
+        upstreamCalls += 1;
+
+        assert.equal(url.pathname, '/eapi/album/v3/detail');
+        assert.equal(init?.method, 'POST');
+        assert.equal(new Headers(init?.headers).get('Content-Type'), 'application/x-www-form-urlencoded');
+        assert.match(new Headers(init?.headers).get('Cookie') || '', /(?:^|; )NMTID=00[a-f0-9]{30}(?:;|$)/);
+
+        const body = decodeNeteaseEapiRequest(init?.body || '', '/api/album/v3/detail');
+        assert.equal(body.id, 3411281);
+        assert.equal(
+            decryptAes128Ecb(body.cache_key, ')(13daqP@ssw0rd~', 'base64'),
+            'id=3411281'
+        );
+
+        return jsonUpstreamResponse({
+            code: 200,
+            album: { id: 3411281, name: 'Example Album' },
+            songs: [createRawSong(3), createRawSong(1)],
+        });
+    }, async () => {
+        const response = await requestWorker(
+            'https://worker.example/song?server=netease&type=album&id=3411281&br=320',
+            {
+                AUTH_ENABLED: 'true',
+                AUTH_SECRET: authSecret,
+            }
+        );
+        const payload = await response.json();
+
+        assert.equal(response.status, 200);
+        assert.equal(upstreamCalls, 1);
+        assert.deepEqual(payload.map((song) => song.name), ['Song 3', 'Song 1']);
+        assert.deepEqual(Object.keys(payload[0]), ['name', 'artist', 'album', 'url', 'pic', 'lrc']);
+        assert.equal(payload[0].artist, 'Artist 3/Guest');
+        assert.equal(payload[0].album, 'Album 3');
+
+        const endpoints = [
+            [payload[0].url, 'url', '3'],
+            [payload[0].pic, 'pic', '900003'],
+            [payload[0].lrc, 'lrc', '3'],
+        ];
+        for (const [value, type, id] of endpoints) {
+            const endpoint = new URL(value);
+            assert.equal(endpoint.pathname, '/song');
+            assert.equal(endpoint.searchParams.get('server'), 'netease');
+            assert.equal(endpoint.searchParams.get('type'), type);
+            assert.equal(endpoint.searchParams.get('id'), id);
+            assert.equal(
+                endpoint.searchParams.get('auth'),
+                await hmacSha256(`netease${type}${id}`, authSecret)
+            );
+        }
+        assert.equal(new URL(payload[0].url).searchParams.get('br'), '320');
+    });
+});
+
+test('album 校验音乐源和专辑 ID，并区分缺失参数', async () => {
+    await withMockFetch(async () => {
+        throw new Error('不应请求上游');
+    }, async () => {
+        const missingIdResponse = await requestWorker(
+            'https://worker.example/?server=netease&type=album'
+        );
+        assert.equal(missingIdResponse.status, 400);
+        assert.deepEqual(await missingIdResponse.json(), { error: '缺少专辑 ID' });
+
+        const tencentResponse = await requestWorker(
+            'https://worker.example/?server=tencent&type=album&id=3411281'
+        );
+        assert.equal(tencentResponse.status, 400);
+        assert.deepEqual(await tencentResponse.json(), {
+            error: 'album 目前仅支持网易云音乐',
+        });
+
+        const invalidIdResponse = await requestWorker(
+            'https://worker.example/?server=netease&type=album&id=12abc'
+        );
+        assert.equal(invalidIdResponse.status, 400);
+        assert.deepEqual(await invalidIdResponse.json(), {
+            error: '网易云专辑 ID 必须是数字',
+        });
+    });
+});
+
+test('网易云不存在或无歌曲的 album 返回 404', async () => {
+    await withMockFetch(async (input) => {
+        assert.equal(new URL(String(input)).pathname, '/eapi/album/v3/detail');
+        return jsonUpstreamResponse({ code: 404 });
+    }, async () => {
+        const response = await requestWorker(
+            'https://worker.example/?server=netease&type=album&id=3411281'
+        );
+
+        assert.equal(response.status, 404);
+        assert.deepEqual(await response.json(), { error: '网易云专辑不存在或为空' });
+    });
+});
+
+test('网易云 album 拒绝上游返回的错配专辑', async () => {
+    await withMockFetch(async (input) => {
+        assert.equal(new URL(String(input)).pathname, '/eapi/album/v3/detail');
+        return jsonUpstreamResponse({
+            code: 200,
+            album: { id: 9999999 },
+            songs: [createRawSong(1)],
+        });
+    }, async () => {
+        const response = await requestWorker(
+            'https://worker.example/?server=netease&type=album&id=3411281'
+        );
+
+        assert.equal(response.status, 502);
+        assert.deepEqual(await response.json(), { error: '网易云专辑详情 ID 不匹配' });
     });
 });

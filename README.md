@@ -1,11 +1,11 @@
 # Cloudflare Worker 版简化 Meting API
 
-这个版本以单曲解析为主，并支持网易云音乐歌单解析。目标是部署到 Cloudflare Workers 后，尽量兼容原本 Meting API 的接口风格。
+这个版本以单曲解析为主，并支持网易云音乐歌单和专辑解析。目标是部署到 Cloudflare Workers 后，尽量兼容原本 Meting API 的接口风格。
 
 和当前 PHP 版相比，删掉了这些能力：
 
 - `search`
-- `name/artist/album/url/pic/lrc` 分路由输出
+- `name` / `artist`，以及 PHP 版“按歌曲 ID 返回专辑名”的 `album` 标量分路由（本 Worker 的 `type=album` 改为按专辑 ID 返回歌曲列表）
 - `handsome`
 - `yrc/qrc` 逐字歌词
 - PHP 侧的 APCu / 文件缓存 / PV 统计
@@ -14,6 +14,7 @@
 
 - `netease` / `tencent` 单曲解析
 - 网易云音乐 `playlist` 解析
+- 网易云音乐 `album` 解析
 - `Referer` / `Origin` 白名单
 - Cloudflare Cache API 缓存
 - 网易云 Cookie 定时检查与手动刷新到 KV
@@ -26,13 +27,14 @@
 - `GET /?server=netease&type=song&id=2608813265`
 - `GET /song?server=netease&type=song&id=2608813265`
 - `GET /?server=netease&type=playlist&id=2619366284`
+- `GET /?server=netease&type=album&id=3411281`
 
 说明：
 
-- `id` 必填；`type=playlist` 时填写歌单 ID，其他类型填写对应的歌曲或资源 ID
+- `id` 必填；`type=playlist` 时填写歌单 ID，`type=album` 时填写专辑 ID，其他类型填写对应的歌曲或资源 ID
 - `server` 选填，支持 `netease` / `tencent`，默认 `netease`
-- `type` 支持 `song` / `playlist` / `url` / `pic` / `lrc`，默认 `song`
-- `playlist` 当前只支持 `server=netease`
+- `type` 支持 `song` / `playlist` / `album` / `url` / `pic` / `lrc`，默认 `song`
+- `playlist` 和 `album` 当前只支持 `server=netease`
 
 ## 返回格式
 
@@ -50,7 +52,9 @@
 ]
 ```
 
-`type=playlist` 返回格式与 PHP 版 `meting-api` 对齐，并同样返回当前 Worker 的二级接口地址：
+`type=playlist` 和 `type=album` 返回格式与 PHP 版 `Meting::playlist()` / `Meting::album()` 的歌曲列表对齐，并同样返回当前 Worker 的二级接口地址：
+
+> 注意：这里的 `type=album` 接受专辑 ID，语义对应底层 `Meting::album($id)` 和 MusicBot-Go 的专辑集合；它不同于 `meting-api/index.php` 中公开的同名路由（后者接受歌曲 ID，只返回专辑名）。
 
 ```json
 [
@@ -69,6 +73,7 @@
 
 - `type=song` 返回 JSON 数组
 - `type=playlist` 返回歌单内全部可用歌曲的 JSON 数组；优先保持网易云客户端展示的手动顺序，缺失的歌曲详情会按 100 首一批补全
+- `type=album` 根据网易云专辑 ID 返回专辑内全部歌曲的 JSON 数组，并保持上游专辑曲序
 - `type=url` 返回 302 到真实音频地址
 - `type=pic` 返回 302 到真实封面地址
 - `type=lrc` 返回纯文本歌词
@@ -254,10 +259,10 @@ wrangler secret put TELEGRAM_CHAT_ID
 
 - `type=song` 的输出结构改成更接近老版 Meting API 的 `title` / `author` / `url` / `pic` / `lrc`。
 - `type=song` 只取歌曲元数据，`url` / `pic` / `lrc` 的真实内容改由二级接口返回。
-- 网易云的单曲详情、歌单详情、批量歌曲详情、音频地址和歌词统一使用 EAPI；移动端 Cookie 会自动补齐 `NMTID` 等必要字段。登录 token refresh 仍使用对应的 WEAPI 续期接口。
+- 网易云的单曲详情、歌单详情、专辑详情、批量歌曲详情、音频地址和歌词统一使用 EAPI；专辑请求按网易云客户端协议生成加密 `cache_key`，移动端 Cookie 会自动补齐 `NMTID` 等必要字段。登录 token refresh 仍使用对应的 WEAPI 续期接口。
 - `type=playlist` 会请求完整的 `playlist.tracks` 并优先采用其客户端展示顺序；若 `tracks` 不完整，再按 `trackIds` 补齐缺失歌曲，并以 100 首为一批获取详情。
 - 白名单校验放在缓存读取之前，避免缓存命中绕过来源限制。
-- 鉴权语义对齐原项目：只对 `url` / `pic` / `lrc` 强制校验 `auth`，`song` / `playlist` 只负责生成带签名的二级链接。
+- 鉴权语义对齐原项目：只对 `url` / `pic` / `lrc` 强制校验 `auth`，`song` / `playlist` / `album` 只负责生成带签名的二级链接。
 - 如果启用了 `AUTH_ENABLED`（或直接配置了 `AUTH_SECRET`），会对 `url` / `pic` / `lrc` 生成 HMAC-SHA256 `auth` 参数；缺失或错误签名会返回 `403 {"error":"非法请求"}`。
 - 缓存使用 `caches.default`，缓存键会包含 `type`、`server`、`id`、`DEFAULT_BR`、`PICSIZE`、`LRCTYPE`。
 - 网易云 Cookie 使用顺序是 KV 优先，其次 `NETEASE_COOKIE` Secret，最后内置默认 Cookie。
@@ -265,7 +270,7 @@ wrangler secret put TELEGRAM_CHAT_ID
 ## 已知限制
 
 - 网易云加密逻辑已经迁到 Worker 里，但仍依赖上游接口可用性。
-- `playlist` 暂不支持 QQ 音乐。
+- `playlist` 和 `album` 暂不支持 QQ 音乐。
 - 原 PHP 仓库没有网易云 Cookie 续签代码；这里新增的是 Worker 侧的网页端 Cookie 刷新逻辑。
 - QQ 音乐部分歌曲可能依赖可用 Cookie。
 - 当前没有做请求限流；如果要继续收敛公开访问，建议后续接入 Cloudflare Rate Limiting 或 Turnstile。
