@@ -4,7 +4,7 @@ compatibility_date = "2026-04-08"
 
 [vars]
 DEBUG_ALLOW_ALL_REFERERS = "false"
-AUTH_ENABLED = "true"
+AUTH_ENABLED = "false"
 DEFAULT_SERVER = "netease"
 DEFAULT_BR = "320"
 CACHE_MAX_AGE = "300"
