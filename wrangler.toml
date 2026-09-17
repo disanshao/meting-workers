@@ -18,9 +18,4 @@ NETEASE_COOKIE_REFRESH_ENABLED = "true"
 crons = ["0 */4 * * *"]
 
 # Public repo note:
-# Do not commit KV namespace IDs here. Generate a private deploy config with:
-# METING_KV_NAMESPACE_ID=<id> node scripts/generate-wrangler-config.mjs
-# wrangler deploy --config .wrangler/wrangler.generated.toml
 
-[secrets]
-required = ["SECRET_DOMAIN", "AUTH_SECRET"]
