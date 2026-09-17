@@ -3,6 +3,8 @@ main = "src/index.js"
 compatibility_date = "2026-04-08"
 
 [vars]
+AUTH_SECRET = "fake_secret_for_build"
+SECRET_DOMAIN = "mymusic-api.wowqazq.workers.dev"
 DEBUG_ALLOW_ALL_REFERERS = "false"
 AUTH_ENABLED = "false"
 DEFAULT_SERVER = "netease"
